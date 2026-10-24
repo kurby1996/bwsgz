@@ -1,0 +1,25 @@
+Usage: blastem [OPTIONS] ROMFILE [WIDTH] [HEIGHT]
+Options:
+	-h          Print this help text
+	-r (J|U|E)  Force region to Japan, US or Europe respectively
+	-m MACHINE  Force emulated machine type to MACHINE. Valid values are:
+                   sms    - Sega Master System/Mark III
+                   gg     - Sega Game Gear
+                   sg     - Sega SG-1000
+                   sc     - Sega SC-3000
+                   gen    - Sega Genesis/Megadrive
+                   32x    - Sega 32X
+                   pico   - Sega Pico
+                   copera - Yamaha Copera
+                   media  - Media Player
+                   laser  - Pioneer LaserActive (no PAC)
+	-f          Toggles fullscreen mode
+	-g          Disable OpenGL rendering
+	-s FILE     Load a GST format savestate from FILE
+	-o FILE     Load FILE as a lock-on cartridge
+	-d          Enter debugger on startup
+	-n          Disable Z80
+	-v          Display version number and exit
+	-l          Log 68K code addresses (useful for assemblers)
+	-y          Log individual YM-2612 channels to WAVE files
+   -e FILE     Write hardware event log to FILE

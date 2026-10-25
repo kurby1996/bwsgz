@@ -1,0 +1,7 @@
+@echo off
+setlocal DisableDelayedExpansion
+chcp 65001 >nul
+echo 请先关闭正在运行的游戏窗口，再按任意键启动修改结果。
+pause >nul
+cd /d "F:\AI\霸王三国志\霸王三国志-免登录版\blastem"
+start "" "F:\AI\霸王三国志\霸王三国志-免登录版\blastem\blastem.exe" -s "F:\AI\霸王三国志\修改结果\quicksave-修改.state" "F:\AI\霸王三国志\霸王三国志-免登录版\roms\三國志II-霸王三国志.md"

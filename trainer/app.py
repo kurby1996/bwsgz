@@ -2,19 +2,24 @@
 from pathlib import Path
 import copy
 import os
+import queue
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 try:
     from .model import GameImage, NAME_BASE
+    from .launcher import build_launcher, write_launcher, restart_from_launcher
 except ImportError:
     from model import GameImage, NAME_BASE
+    from launcher import build_launcher, write_launcher, restart_from_launcher
 
 ROOT = Path(__file__).resolve().parent.parent
 ROM = ROOT / '霸王三国志-免登录版/roms/三國志II-霸王三国志.md'
 EMU = ROOT / '霸王三国志-免登录版/blastem/blastem.exe'
 LABELS = dict(intelligence='智力', war='武力', charm='魅力', loyalty='忠诚',
-              troops='兵力（百人）', arms='武器量', training='训练', gold='金钱', food='粮草', population='人口')
+              troops='兵力（百人）', arms='武器量', training='训练', gold='金钱', food='粮草', population='人口',
+              civil_loyalty='民忠',land='土地',flood_control='治水',trust='信（全国）',horses='马匹',price='相场')
 
 
 def name_for(rom, identity):
@@ -61,7 +66,17 @@ class Trainer(tk.Tk):
         self.status = tk.StringVar(value='请选择游戏文件。')
         self.summary = tk.StringVar()
         self.fields = {}
+        self.sorting = {}
+        self.column_labels = {}
+        self.checked_officers = set()
+        self.transfer_nation = tk.StringVar()
+        self.transfer_province = tk.StringVar()
+        self.transfer_hint = tk.StringVar()
+        self.transfer_nations = {}
+        self.transfer_provinces = {}
         self.rename = tk.StringVar()
+        self.auto_restart = tk.BooleanVar(value=True)
+        self.restarting = False
         self._build()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.bind('<Control-o>', lambda _: self.open_file())
@@ -78,7 +93,11 @@ class Trainer(tk.Tk):
         for text, cmd in [('打开存档 / ROM', self.open_file), ('读取最新即时存档', self.open_latest),
                           ('新开局能力设置', lambda: self.open_path(ROM)), ('另存修改结果', self.save_as),
                           ('使用说明', self.help)]:
-            ttk.Button(tools, text=text, command=cmd).pack(side='left', padx=(0, 7))
+            button = ttk.Button(tools, text=text, command=cmd)
+            button.pack(side='left', padx=(0, 7))
+            if text=='另存修改结果':
+                self.save_button = button
+        ttk.Checkbutton(tools,text='另存后自动重启游戏',variable=self.auto_restart).pack(side='left',padx=(6,0))
         ttk.Label(shell, textvariable=self.status, wraplength=1100).pack(anchor='w', pady=(12, 5))
         filters = ttk.Frame(shell)
         filters.pack(fill='x', pady=6)
@@ -93,28 +112,59 @@ class Trainer(tk.Tk):
         self.tabs = ttk.Notebook(shell)
         self.tabs.pack(fill='both', expand=True)
         for mode, caption, columns in [
-            ('officer', '武将与军事', [('id','编号'),('name','姓名'),('nation','国家'),('province','州'),
+            ('officer', '武将与军事', [('checked','勾选'),('id','编号'),('name','姓名'),('nation','国家'),('province','州'),
               ('intelligence','智力'),('war','武力'),('charm','魅力'),('loyalty','忠诚'),('troops','兵力/百人'),('arms','武器量'),('training','训练')]),
-            ('province', '州城与国家资源', [('id','州编号'),('nation','国家'),('gold','金钱'),('food','粮草'),('population','人口'),('officers','武将数'),('troops','总兵力')])]:
+            ('province', '州城内政与资源', [('id','州编号'),('nation','国家'),('population','人口'),('gold','金钱'),('food','粮草'),
+              ('civil_loyalty','民忠'),('land','土地'),('flood_control','治水'),('trust','信/全国'),('horses','马匹'),('price','相场'),
+              ('officers','武将数'),('free_officers','在野数'),('troops','兵士/百人')])]:
             tab = ttk.Frame(self.tabs, padding=10)
             self.tabs.add(tab, text=caption)
+            tab.columnconfigure(0,weight=1)
+            tab.rowconfigure(0,weight=1)
             frame = ttk.Frame(tab)
-            frame.pack(fill='both', expand=True)
-            table = ttk.Treeview(frame, columns=[c[0] for c in columns], show='headings', selectmode='extended')
+            frame.grid(row=0,column=0,sticky='nsew')
+            table = ttk.Treeview(frame, columns=[c[0] for c in columns], show='headings', selectmode='extended', height=4)
+            self.column_labels[mode] = dict(columns)
             for key, label in columns:
-                table.heading(key, text=label)
+                table.heading(key, text=label, command=lambda m=mode, k=key: self.sort_table(m,k))
                 table.column(key, width=65 if key != 'name' else 110, anchor='center', stretch=True)
+                if key=='checked':
+                    table.column(key, width=48, minwidth=48, stretch=False)
             bar = ttk.Scrollbar(frame, orient='vertical', command=table.yview)
             table.configure(yscrollcommand=bar.set)
             bar.pack(side='right', fill='y')
             table.pack(fill='both', expand=True)
             setattr(self, mode + '_table', table)
             table.bind('<<TreeviewSelect>>', lambda _, m=mode: self.select(m))
+            if mode=='province':
+                ttk.Label(tab,text='“信”由所属国家各州共享；兵士、武将数和在野数由名单汇总。民忠/土地/治水/信/马匹 0–100，相场 20–70。',wraplength=900).grid(row=1,column=0,sticky='w',pady=(8,0))
+            if mode=='officer':
+                table.bind('<Button-1>', self.click_officer_check)
+                table.bind('<space>', self.toggle_selected_checks)
+                transfer = ttk.LabelFrame(tab, text='武将调动：勾选可跨国家筛选保留；目标国家与上方查看筛选相互独立', padding=8)
+                transfer.grid(row=1,column=0,sticky='ew',pady=(8,0))
+                picks = ttk.Frame(transfer)
+                picks.pack(fill='x')
+                ttk.Button(picks,text='勾选选中行',command=self.check_selected).pack(side='left',padx=(0,5))
+                ttk.Button(picks,text='勾选当前筛选',command=lambda: self.check_visible()).pack(side='left',padx=(0,5))
+                ttk.Button(picks,text='清空勾选',command=self.clear_officer_checks).pack(side='left',padx=(0,12))
+                ttk.Label(picks,text='目标国家').pack(side='left')
+                self.transfer_nation_box = ttk.Combobox(picks,textvariable=self.transfer_nation,state='readonly',width=19)
+                self.transfer_nation_box.pack(side='left',padx=5)
+                self.transfer_nation_box.bind('<<ComboboxSelected>>',lambda _: self.refresh_transfer_targets())
+                ttk.Label(picks,text='目标州').pack(side='left')
+                self.transfer_province_box = ttk.Combobox(picks,textvariable=self.transfer_province,state='readonly',width=9)
+                self.transfer_province_box.pack(side='left',padx=5)
+                self.transfer_button = ttk.Button(picks,text='转入勾选武将',command=self.transfer_checked)
+                self.transfer_button.pack(side='left')
+                ttk.Label(transfer,textvariable=self.transfer_hint).pack(anchor='w',pady=(5,0))
             edit = ttk.LabelFrame(tab, text='勾选要修改的项目，再应用到选中行（Ctrl / Shift 可多选）', padding=10)
-            edit.pack(fill='x', pady=(12, 0))
-            keys = ['intelligence','war','charm','loyalty','troops','arms','training'] if mode == 'officer' else ['gold','food','population']
+            edit.grid(row=2,column=0,sticky='ew',pady=(12,0))
+            keys = ['intelligence','war','charm','loyalty','troops','arms','training'] if mode == 'officer' else [
+                'gold','food','population','civil_loyalty','land','flood_control','trust','horses','price']
             for n, key in enumerate(keys):
-                enabled, value = tk.BooleanVar(), tk.StringVar(value='100' if mode == 'officer' else '30000')
+                default = '50' if key=='price' else '30000' if key in ('gold','food','population') else '100'
+                enabled, value = tk.BooleanVar(), tk.StringVar(value=default)
                 col = n % 4
                 row = (n // 4) * 2
                 check = ttk.Checkbutton(edit, text=LABELS[key], variable=enabled)
@@ -128,12 +178,12 @@ class Trainer(tk.Tk):
             ttk.Button(buttons, text='选中当前筛选的全部行', command=lambda t=table: t.selection_set(t.get_children())).pack(side='left', padx=(0,8))
             ttk.Button(buttons, text='取消勾选', command=lambda m=mode: self.clear_checks(m)).pack(side='left')
         self.name_bar = ttk.Frame(shell)
-        self.name_bar.pack(fill='x', pady=(10,0))
+        self.name_bar.pack(fill='x',side='bottom',before=self.tabs,pady=(10,0))
         ttk.Label(self.name_bar, text='ROM 改名（最多三个游戏已有汉字）').pack(side='left')
         ttk.Entry(self.name_bar, textvariable=self.rename, width=15).pack(side='left', padx=8)
         self.rename_button = ttk.Button(self.name_bar, text='修改所选武将姓名', command=self.rename_selected)
         self.rename_button.pack(side='left')
-        ttk.Label(shell, text='兵力 0–100 百人（最多一万兵）；武器 0–10000。仅编辑内政地图即时存档，战斗或命令执行中不可编辑。').pack(anchor='w', pady=(10,0))
+        ttk.Label(shell, text='兵力 0–100 百人（最多一万兵）；武器 0–10000。仅编辑内政地图即时存档，战斗或命令执行中不可编辑。').pack(anchor='w',side='bottom',before=self.name_bar,pady=(10,0))
 
     def unsaved_ok(self):
         return not self.dirty or messagebox.askyesno('尚未保存', '当前修改还未另存，是否放弃这些修改？', parent=self)
@@ -163,6 +213,7 @@ class Trainer(tk.Tk):
         try:
             image = GameImage(path, ROM)
             self.image = image
+            self.checked_officers.clear()
             self.saved_path = None
             self.dirty = False
             self.nations = {'全部国家':None}
@@ -219,20 +270,122 @@ class Trainer(tk.Tk):
                     if query and query not in name and query not in str(row['index']+1):
                         continue
                     province = '—' if row['province'] is None else row['province']+1
-                    values = [row['index']+1, name, self.country_name(row['nation']), province]
+                    values = ['☑' if row['index'] in self.checked_officers else '☐', row['index']+1, name, self.country_name(row['nation']), province]
                     values.extend('—' if row.get(k) is None else row[k] for k in ('intelligence','war','charm','loyalty','troops','arms','training'))
                 else:
                     ids = set(row['officer_indices'])
-                    values = [row['index']+1,self.country_name(row['nation']),row['gold'],row['food'],row['population'],len(ids),sum(o['troops'] for o in os_ if o['index'] in ids)]
+                    values = [row['index']+1,self.country_name(row['nation']),row['population'],row['gold'],row['food']]
+                    values.extend('—' if row[k] is None else row[k] for k in ('civil_loyalty','land','flood_control','trust','horses','price'))
+                    values.extend([len(ids),len(row['free_officer_indices']),sum(o['troops'] for o in os_ if o['index'] in ids)])
                 iid = str(row['index'])
                 table.insert('', 'end', iid=iid, values=values)
                 if iid in selected:
                     table.selection_add(iid)
+            self.sort_table(mode)
+        self.refresh_transfer_targets()
         visible_ps = [p for p in ps if nation is None or p['nation']==nation]
         if ps:
             self.summary.set(f"当前国家筛选：{len(visible_ps)} 州　金钱合计 {sum(p['gold'] for p in visible_ps):,}　粮草合计 {sum(p['food'] for p in visible_ps):,}　（搜索仅筛武将）")
         else:
             self.summary.set('新开局模式：修改历史武将的初始能力和姓名，另存 ROM 后从新剧本开始生效。')
+
+    def sort_table(self, mode, column=None):
+        """数字列按数值排序，缺失值始终放末尾，重绘与筛选保持排序。"""
+        if column is not None:
+            previous, descending = self.sorting.get(mode,(None,False))
+            self.sorting[mode] = (column, not descending if previous==column else False)
+        if mode not in self.sorting:
+            return
+        column, descending = self.sorting[mode]
+        table = getattr(self,mode+'_table')
+        numeric = column not in ('name','nation')
+        valid, missing = [], []
+        for iid in table.get_children():
+            value = table.set(iid,column)
+            if value in ('—','',None):
+                missing.append(iid)
+                continue
+            key = int(value=='☑') if column=='checked' else int(value) if numeric else str(value)
+            valid.append((key,iid))
+        # 相同数值以编号升序稳定打底，避免筛选、修改后同值行任意跳动。
+        valid.sort(key=lambda entry:int(entry[1]))
+        valid.sort(key=lambda entry:entry[0],reverse=descending)
+        for pos,iid in enumerate([i for _,i in valid]+missing):
+            table.move(iid,'',pos)
+        for key,label in self.column_labels[mode].items():
+            table.heading(key,text=label+(' ▼' if descending else ' ▲') if key==column else label)
+
+    def click_officer_check(self, event):
+        table = self.officer_table
+        if table.identify_region(event.x,event.y)=='cell' and table.identify_column(event.x)=='#1':
+            iid = table.identify_row(event.y)
+            if iid:
+                index = int(iid)
+                self.checked_officers.symmetric_difference_update({index})
+                self.refresh_checks()
+            return 'break'
+
+    def toggle_selected_checks(self, event=None):
+        self.checked_officers.symmetric_difference_update(int(i) for i in self.officer_table.selection())
+        self.refresh_checks()
+        return 'break'
+
+    def check_selected(self):
+        self.checked_officers.update(int(i) for i in self.officer_table.selection())
+        self.refresh_checks()
+
+    def check_visible(self):
+        self.checked_officers.update(int(i) for i in self.officer_table.get_children())
+        self.refresh_checks()
+
+    def clear_officer_checks(self):
+        self.checked_officers.clear()
+        self.refresh_checks()
+
+    def refresh_checks(self):
+        for iid in self.officer_table.get_children():
+            self.officer_table.set(iid,'checked','☑' if int(iid) in self.checked_officers else '☐')
+        self.sort_table('officer')
+        self.refresh_transfer_targets()
+
+    def refresh_transfer_targets(self):
+        is_state = self.image is not None and self.image.kind!='rom'
+        self.transfer_nations = {label:ident for label,ident in self.nations.items() if ident not in (None,255)} if is_state else {}
+        self.transfer_nation_box['values'] = list(self.transfer_nations)
+        if self.transfer_nation.get() not in self.transfer_nations:
+            self.transfer_nation.set(next(iter(self.transfer_nations),''))
+        nation = self.transfer_nations.get(self.transfer_nation.get())
+        provinces = self.image.get_provinces() if is_state else []
+        self.transfer_provinces = {f"第 {p['index']+1} 州":p['index'] for p in provinces if p['nation']==nation}
+        self.transfer_province_box['values'] = list(self.transfer_provinces)
+        if self.transfer_province.get() not in self.transfer_provinces:
+            self.transfer_province.set(next(iter(self.transfer_provinces),''))
+        self.transfer_nation_box.configure(state='readonly' if is_state else 'disabled')
+        self.transfer_province_box.configure(state='readonly' if is_state else 'disabled')
+        self.transfer_button.configure(state='normal' if self.transfer_provinces else 'disabled')
+        self.transfer_hint.set(f'已勾选 {len(self.checked_officers)} 人（含筛选外）。君主不能单独调动；原州至少留一人。' if is_state else
+                               '当前是新开局 ROM 模式。请读取内政即时存档后，勾选武将并指定目标国家、州。')
+
+    def transfer_checked(self):
+        if self.image is None:
+            return
+        try:
+            nation = self.transfer_nations.get(self.transfer_nation.get())
+            province = self.transfer_provinces.get(self.transfer_province.get())
+            if nation is None or province is None:
+                raise ValueError('请读取内政即时存档，并选择目标国家与目标州。')
+            trial = copy.deepcopy(self.image)
+            moved = trial.transfer_officers(sorted(self.checked_officers),nation,province)
+            if not moved:
+                self.status.set('勾选武将已在目标州，无需调动。')
+                return
+            self.image = trial
+            self.dirty = True
+            self.checked_officers.clear()
+            self.status.set(f'已暂存 {len(moved)} 名武将转入 {self.country_name(nation)} · 第 {province+1} 州；请另存修改结果。')
+            self.refresh()
+        except ValueError as e:
+            messagebox.showerror('调动未应用',str(e),parent=self)
 
     def select(self, mode):
         table = getattr(self, mode+'_table')
@@ -299,7 +452,7 @@ class Trainer(tk.Tk):
             messagebox.showerror('无法改名', str(e), parent=self)
 
     def save_as(self):
-        if self.image is None:
+        if self.image is None or self.restarting:
             return
         suffix = {'rom':'.md','gst':'.gst','native':'.state'}[self.image.kind]
         output = ROOT / '修改结果'
@@ -313,33 +466,68 @@ class Trainer(tk.Tk):
             # 原 ROM 保留：新开局修改仅写新文件。
             if Path(path).resolve()==ROM.resolve():
                 raise ValueError('请另存到“修改结果”目录，保留项目原 ROM。')
+            build_launcher(self.image,path)  # 写文件前先确认手柄配置可匹配。
             self.saved_path = self.image.save(path)
-            launcher = self.saved_path.with_suffix(self.saved_path.suffix + '.启动.bat')
-            # 使用相对原始 ROM 和完整结果路径，避免槽位覆盖与错误读档。
-            escaped_path = str(self.saved_path).replace('%', '%%')
-            arguments = f'"{escaped_path}"' if self.image.kind=='rom' else f'-s "{escaped_path}" "{ROM}"'
-            script = ('@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n'
-                      'echo 请先关闭正在运行的游戏窗口，再按任意键启动修改结果。\r\npause >nul\r\n'
-                      f'cd /d "{EMU.parent}"\r\nstart "" "{EMU}" {arguments}\r\n')
-            launcher.write_text(script, encoding='utf-8')
+            launcher = write_launcher(self.image,self.saved_path)
             self.dirty = False
             self.status.set('已保存：'+str(self.saved_path))
+            if self.auto_restart.get():
+                self.start_restart(launcher)
+                return
             instructions = ('打开这个新 ROM，从新剧本开始。' if self.image.kind=='rom' else
-                '先关闭游戏，再运行结果文件旁的“.启动.bat”，会直接加载此修改存档。')
+                '先关闭游戏，再运行下面这个启动文件，直接加载修改存档：\n'+str(launcher))
             backup = '\n覆盖前备份：'+str(self.image.last_backup) if self.image.last_backup else ''
             messagebox.showinfo('保存成功', instructions+backup, parent=self)
         except (OSError, ValueError) as e:
             messagebox.showerror('保存失败',str(e),parent=self)
 
+    def start_restart(self, launcher):
+        self.restarting = True
+        self.save_button.configure(state='disabled')
+        self.status.set('已保存，正在退出旧游戏并加载：'+str(self.saved_path))
+        result = queue.Queue()
+
+        def work():
+            try:
+                restart_from_launcher(launcher)
+                result.put(None)
+            except Exception as e:
+                result.put(str(e))
+
+        def poll():
+            try:
+                error = result.get_nowait()
+            except queue.Empty:
+                self.after(100,poll)
+                return
+            self.restarting = False
+            self.save_button.configure(state='normal')
+            if error is None:
+                self.status.set('已保存并启动修改结果：'+str(self.saved_path))
+            else:
+                self.status.set('已保存，自动启动未完成：'+str(self.saved_path))
+                messagebox.showerror('已保存，但自动加载未完成',error+'\n启动文件：'+str(launcher),parent=self)
+
+        threading.Thread(target=work,daemon=True).start()
+        self.after(100,poll)
+
     def help(self):
         messagebox.showinfo('使用说明',
             '已有进度：在内政地图按 ` 保存即时存档 → 读取最新即时存档 → 选国家/武将/州 → 勾选字段 → 应用 → 另存 → 回游戏读取。\n\n'
+            '默认勾选“另存后自动重启游戏”：保存成功后正常退出本项目旧游戏，并自动运行新结果；取消勾选可只保存。\n\n'
             '新游戏：点“新开局能力设置” → 修改能力或姓名 → 另存 ROM → 用新 ROM 开始新剧本。\n\n'
             '按键：方向键选择；A 确认、S 返回、D 为 C 键；Enter 开始；Esc 模拟器菜单；` 即时保存、L 即时读取；F7 暂停；Tab 重启。\n\n'
-            '能力/忠诚/训练 0–100；兵力 0–100 百人；武器 0–10000；金钱粮草 0–30000。人口单位尚待画面核实。\n'
-            '姓名在 ROM 内共享，同一历史人物的所有剧本都会使用新名。暂不修改所属国家与链表。',parent=self)
+            '能力/忠诚/训练 0–100；兵力 0–100 百人；武器 0–10000；金钱粮草 0–30000。人口按画面数值。\n'
+            '州城内政与资源：可改民忠、土地、治水、马匹（0–100），相场（20–70）和国家共享的信（0–100）。\n'
+            '点击表头可升序/降序排序，数字列按数值比较。\n'
+            '转国：先读内政即时存档 → 在武将表勾选人员（切换国家筛选不丢失勾选）→ 选择目标国家和州 → 转入勾选武将 → 另存。\n'
+            '君主不能单独调动，原州至少保留一名在职武将；转出的军师解除原国任命。\n'
+            '姓名在 ROM 内共享，同一历史人物的所有剧本都会使用新名。',parent=self)
 
     def close(self):
+        if self.restarting:
+            self.status.set('正在退出并重启游戏，请稍候再关闭金手指。')
+            return
         if self.unsaved_ok():
             self.destroy()
 

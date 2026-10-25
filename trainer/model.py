@@ -187,11 +187,18 @@ class GameImage:
     def get_provinces(self):
         if self.kind == 'rom':
             return []
-        return [dict(index=i, nation=self._u8(PROVINCE_BASE+i*34+22),
-                     gold=self._u16(PROVINCE_BASE+i*34+16), food=self._u16(PROVINCE_BASE+i*34+18),
-                     population=self._u16(PROVINCE_BASE+i*34+20),
-                     officer_indices=self._chain(self._u32(PROVINCE_BASE+i*34+4), OFFICER_BASE, 24, OFFICER_COUNT))
-                for i in range(PROVINCE_COUNT)]
+        result = []
+        for i in range(PROVINCE_COUNT):
+            a = PROVINCE_BASE + i*PROVINCE_STRIDE
+            nation = self._u8(a+22)
+            result.append(dict(index=i,nation=nation,
+                gold=self._u16(a+16),food=self._u16(a+18),population=self._u16(a+20),
+                land=self._u8(a+28),civil_loyalty=self._u8(a+29),flood_control=self._u8(a+30),
+                horses=self._u8(a+31),price=self._u8(a+32),
+                trust=self._u8(COUNTRY_BASE+nation*COUNTRY_STRIDE+12) if nation<COUNTRY_COUNT else None,
+                officer_indices=self._chain(self._u32(a+4),OFFICER_BASE,24,OFFICER_COUNT),
+                free_officer_indices=self._chain(self._u32(a+8),OFFICER_BASE,24,OFFICER_COUNT)))
+        return result
 
     def get_countries(self):
         if self.kind == 'rom':
@@ -235,11 +242,96 @@ class GameImage:
         if self.kind == 'rom':
             raise ValueError('州资源需要进入剧本后的即时存档。')
         self._index(index, PROVINCE_COUNT)
-        fields = dict(gold=(16, 2, 30000), food=(18, 2, 30000), population=(20, 2, 65535))
+        # ROM 0xEF90–0xF03E: 民=州+1D，土=+1C，水=+1E，
+        # 信=国家+C，马=州+1F，相=+20；价格更新0x3D35A/388限制20..70。
+        fields = dict(gold=(16,2,30000),food=(18,2,30000),population=(20,2,65535),
+                      land=(28,1,100),civil_loyalty=(29,1,100),flood_control=(30,1,100),
+                      horses=(31,1,100),price=(32,1,70),trust=(12,1,100))
         self._changes(changes, fields)
+        if 'price' in changes and changes['price']<20:
+            raise ValueError('相场必须为 20 至 70 的整数。')
+        nation = self._u8(PROVINCE_BASE+index*PROVINCE_STRIDE+22)
+        if 'trust' in changes and (nation>=COUNTRY_COUNT or self._u32(COUNTRY_BASE+nation*COUNTRY_STRIDE)==0):
+            raise ValueError('无主州没有国家共享的“信”；请筛选存续国家后修改。')
         for key, value in changes.items():
             offset, width, _ = fields[key]
-            self._put(PROVINCE_BASE + index * PROVINCE_STRIDE + offset, value, width)
+            address = COUNTRY_BASE+nation*COUNTRY_STRIDE+offset if key=='trust' else PROVINCE_BASE+index*PROVINCE_STRIDE+offset
+            self._put(address,value,width)
+
+    def transfer_officers(self, indices, nation, province):
+        """内政存档中搬移在职武将；整批预检并原子更新州链表与国家归属。
+
+        州 +4 指向首将（太守），将 +0 指向下一将；目标按末尾追加保留
+        原太守。君主不可单独转国，原州不可搬空；转出的军师清除原国任命。
+        返回实际改变州位置的武将编号；不会写入磁盘。
+        """
+        if self.kind == 'rom':
+            raise ValueError('转国需要读取内政地图的即时存档，不能在新开局 ROM 模式使用。')
+        self._validate_state()
+        self._index(nation, COUNTRY_COUNT)
+        self._index(province, PROVINCE_COUNT)
+        chosen = []
+        for index in indices:
+            self._index(index, OFFICER_COUNT)
+            if index not in chosen:
+                chosen.append(index)
+        if not chosen:
+            raise ValueError('请先勾选要转入的武将。')
+        countries = self.get_countries()
+        destination = countries[nation]
+        if destination['ruler_index'] is None or province not in destination['province_indices']:
+            raise ValueError('目标必须是存续国家及其所属州。')
+        head = self._u32(COUNTRY_BASE + nation * COUNTRY_STRIDE + 4)
+        if province not in self._chain(head, PROVINCE_BASE, PROVINCE_STRIDE, PROVINCE_COUNT):
+            raise ValueError('目标州不在该国领州名单中，已拒绝转入。')
+        provinces = self.get_provinces()
+        lists = {p['index']:list(p['officer_indices']) for p in provinces}
+        location = {o:p['index'] for p in provinces for o in p['officer_indices']}
+        rulers = {c['ruler_index'] for c in countries if c['ruler_index'] is not None}
+        moving = []
+        for index in chosen:
+            source = location.get(index)
+            if source is None or provinces[source]['nation'] == 255:
+                raise ValueError(f'编号 {index+1} 不在在职武将名单中；当前只支持在职武将调动。')
+            address = OFFICER_BASE + index * OFFICER_STRIDE
+            if self._u8(address+9) != provinces[source]['nation']:
+                raise ValueError(f'编号 {index+1} 的国家与州名单不一致，已拒绝转国。')
+            if source == province:
+                continue
+            if index in rulers:
+                raise ValueError(f'编号 {index+1} 是君主，不能单独调动。请取消勾选该君主。')
+            moving.append(index)
+        affected = {location[i] for i in moving}
+        for index in moving:
+            lists[location[index]].remove(index)
+        for source in affected:
+            if not lists[source]:
+                raise ValueError(f'第 {source+1} 州会没有任何在职武将。请至少保留一名武将驻守。')
+        if not moving:
+            return []
+        lists[province].extend(moving)
+        # 所有源州的最后一人、君主及目标验证完成后才触碰字节。
+        original = self.data
+        self.data = bytearray(original)
+        try:
+            for p in affected | {province}:
+                chain = lists[p]
+                pointer = lambda i: 0xFF0000 + OFFICER_BASE + i * OFFICER_STRIDE
+                self._put(PROVINCE_BASE + p * PROVINCE_STRIDE + 4, pointer(chain[0]) if chain else 0, 4)
+                for n, index in enumerate(chain):
+                    following = pointer(chain[n+1]) if n+1 < len(chain) else 0
+                    self._put(OFFICER_BASE + index * OFFICER_STRIDE, following, 4)
+            for index in moving:
+                self._put(OFFICER_BASE + index * OFFICER_STRIDE + 9, nation)
+            for country in countries:
+                advisor = country['advisor_index']
+                if country['index'] != nation and advisor in moving:
+                    self._put(COUNTRY_BASE + country['index'] * COUNTRY_STRIDE + 8, 0, 4)
+            self._validate_state()
+        except Exception:
+            self.data = original
+            raise
+        return moving
 
     def save(self, path):
         target = Path(path).resolve()

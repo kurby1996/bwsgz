@@ -13,16 +13,18 @@ class GuiTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=ROOT/'.rea_tmp')
         self.directory = Path(self.tmp.name)
         self.app = Trainer()
+        self.app.auto_restart.set(False)
         self.app.withdraw()
 
     def tearDown(self):
+        self.app.update_idletasks()
         self.app.destroy()
         self.tmp.cleanup()
 
     def test_rom_selection_apply_rename_save_reload(self):
         a = self.app
         self.assertEqual(len(a.officer_table.get_children()),352)
-        self.assertEqual(a.officer_table.item('0')['values'][1], '曹操')
+        self.assertEqual(a.officer_table.set('0','name'), '曹操')
         self.assertEqual(a.tabs.tab(1,'state'),'disabled')
         a.officer_table.selection_set('0','1')
         flag,value,*_ = a.fields[('officer','war')]
